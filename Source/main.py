@@ -67,9 +67,16 @@ class Pager:
 
 
 class Table:
-    def __init__(self, pager, num_rows):
+    def __init__(self, pager=Pager(), num_rows=0):
         self.pager = pager
         self.num_rows = num_rows
+
+
+class Cursor:
+    def __init__(self, table=Table(), row_num=0, end_of_table=False):
+        self.table = table
+        self.row_num = row_num
+        self.end_of_table = end_of_table
 
 
 def print_row(row):
@@ -119,12 +126,28 @@ def get_page(pager, page_num):
         pager.pages[page_num] = page
 
 
-def row_slot(table, row_num):
+
+def table_start(table):
+    return Cursor(table, 0, table.num_rows == 0)
+
+
+def table_end(table):
+    return Cursor(table, table.num_rows, True)
+
+
+def cursor_value(cursor):
+    row_num = cursor.row_num
     page_num = row_num / ROWS_PER_PAGE
-    get_page(table.pager, page_num)
+    get_page(cursor.table.pager, page_num)
     row_offset = row_num % ROWS_PER_PAGE
     byte_offset = row_offset * ROW_SIZE
-    return table.pager.pages, page_num, byte_offset
+    return cursor.table.pager.pages, page_num, byte_offset
+
+
+def cursor_advance(cursor):
+    cursor.row_num += 1
+    if cursor.row_num >= cursor.table.num_rows:
+        cursor.end_of_table = True
 
 
 def pager_open(filename):
@@ -161,8 +184,6 @@ def pager_flush(pager, page_num, size):
 
 
 def db_close(table):
-    #free_memory = lambda page: ""
-
     pager = table.pager
     num_full_pages = table.num_rows / ROWS_PER_PAGE
 
@@ -170,14 +191,12 @@ def db_close(table):
         if not pager.pages[i]:
             continue
         pager_flush(pager, i, PAGE_SIZE)
-        #free_memory(pager.pages[i])
     
     num_additional_rows = table.num_rows % ROWS_PER_PAGE
     if num_additional_rows > 0:
         page_num = num_full_pages
         if pager.pages[page_num]:
             pager_flush(pager, page_num, num_additional_rows * ROW_SIZE)
-            #free_memory(pager.pages[page_num])
 
     pager.file_descriptor.close()
 
@@ -224,16 +243,21 @@ def execute_insert(statement, table):
         return EXECUTE_TABLE_FULL
     
     row_to_insert = statement.row_to_insert
-    serialize_row(row_to_insert, row_slot(table, table.num_rows))
+    cursor = table_end(table)
+    serialize_row(row_to_insert, cursor_value(cursor))    
+
     table.num_rows += 1
     return EXECUTE_SUCCESS
 
 
 def execute_select(statement, table):
-    for i in range(table.num_rows):
-        row = Row()
-        deserialize_row(row_slot(table, i), row)
+    cursor = table_start(table)
+    row = Row()
+    while not cursor.end_of_table:
+        deserialize_row(cursor_value(cursor), row)
         print_row(row)
+        cursor_advance(cursor)
+
     return EXECUTE_SUCCESS
 
 
