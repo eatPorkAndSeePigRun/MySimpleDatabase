@@ -7,3 +7,7 @@
 `rspec --format doc`
 
 `python -m pdb main.py`
+
+bug是好老师
+
+xxd 以十六进制形式表示

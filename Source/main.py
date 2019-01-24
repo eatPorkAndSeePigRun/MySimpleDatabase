@@ -1,3 +1,5 @@
+import os
+import sys
 import struct
 
 
@@ -42,7 +44,6 @@ class Statement:
         self.row_to_insert = row_to_insert
 
 
-# TODO size_of_attribute = lambda struct, attribute : len()
 # compact representation of a row
 ID_SIZE         = struct.calcsize("i")
 USERNAME_SIZE   = struct.calcsize("%ds" % COLUMN_USERNAME_SIZE)
@@ -58,9 +59,16 @@ ROWS_PER_PAGE   = PAGE_SIZE / ROW_SIZE
 TABLE_MAX_ROWS  = ROWS_PER_PAGE * TABLE_MAX_PAGES
 
 
-class Table:
-    def __init__(self, pages=["" for i in range(TABLE_MAX_PAGES)], num_rows=0):
+class Pager:
+    def __init__(self, file_descriptor=-1, file_length=-1, pages=["" for i in range(TABLE_MAX_PAGES)]):
+        self.file_descriptor = file_descriptor
+        self.file_length = file_length
         self.pages = pages
+
+
+class Table:
+    def __init__(self, pager, num_rows):
+        self.pager = pager
         self.num_rows = num_rows
 
 
@@ -76,15 +84,15 @@ def serialize_row(src, dest):
     temp = temp + struct.pack("%ds" % USERNAME_SIZE, src.username)
     temp = temp + struct.pack("%ds" % EMAIL_SIZE, src.email)
 
-    table, page_num, byte_offset = dest
-    old_page = table.pages[page_num]
+    pages, page_num, byte_offset = dest
+    old_page = pages[page_num]
     new_page = old_page[:byte_offset] + temp + old_page[byte_offset+len(temp):]
-    table.pages[page_num] = new_page    
+    pages[page_num] = new_page    
 
 
 def deserialize_row(src, dest):
-    table, page_num, byte_offset = src
-    page = table.pages[page_num]
+    pages, page_num, byte_offset = src
+    page = pages[page_num]
 
     temp = page[byte_offset:]
     dest.id = struct.unpack("i", temp[ID_OFFSET : ID_OFFSET+ID_SIZE])[0]
@@ -92,13 +100,46 @@ def deserialize_row(src, dest):
     dest.email = struct.unpack("%ds" % EMAIL_SIZE, temp[EMAIL_OFFSET : EMAIL_OFFSET+EMAIL_SIZE])[0]
 
 
+def get_page(pager, page_num):
+    malloc_memory = lambda : "\x00" * PAGE_SIZE
+
+    if page_num > TABLE_MAX_PAGES:
+        print "Tried to fetch page number out of bounds. %d > %d" % (page_num, TABLE_MAX_PAGES)
+        exit(0)
+    if not pager.pages[page_num]:
+        page = malloc_memory()
+        num_pages = pager.file_length / PAGE_SIZE
+        if pager.file_length % PAGE_SIZE:
+            num_pages += 1
+        if page_num <= num_pages:
+            pager.file_descriptor.seek(page_num * PAGE_SIZE, os.SEEK_SET)
+            buf = pager.file_descriptor.read(PAGE_SIZE)
+            if buf:
+                page = buf + page[len(buf):]
+        pager.pages[page_num] = page
+
+
 def row_slot(table, row_num):
     page_num = row_num / ROWS_PER_PAGE
-    if not table.pages[page_num]:
-        table.pages[page_num] = "\x00" * PAGE_SIZE
+    get_page(table.pager, page_num)
     row_offset = row_num % ROWS_PER_PAGE
     byte_offset = row_offset * ROW_SIZE
-    return table, page_num, byte_offset
+    return table.pager.pages, page_num, byte_offset
+
+
+def pager_open(filename):
+    fd = open(filename, "rb+")
+    fd.seek(0, os.SEEK_END)
+    file_length = fd.tell()
+    pager = Pager(fd, file_length)
+    return pager 
+
+
+def db_open(filename):
+    pager = pager_open(filename)
+    num_rows = pager.file_length / ROW_SIZE
+    table = Table(pager, num_rows)
+    return table
 
 
 def print_prompt():
@@ -110,9 +151,41 @@ def read_input():
     return InputBuffer(buf)
 
 
-def do_meta_command(input_buffer):
-    if input_buffer.buffer == ".exit":
+def pager_flush(pager, page_num, size):
+    if not pager.pages[page_num]:
+        print "Tried to flush null page"
         exit(0)
+
+    pager.file_descriptor.seek(page_num * PAGE_SIZE, os.SEEK_SET)
+    pager.file_descriptor.write(pager.pages[page_num][:size])
+
+
+def db_close(table):
+    #free_memory = lambda page: ""
+
+    pager = table.pager
+    num_full_pages = table.num_rows / ROWS_PER_PAGE
+
+    for i in range(num_full_pages):
+        if not pager.pages[i]:
+            continue
+        pager_flush(pager, i, PAGE_SIZE)
+        #free_memory(pager.pages[i])
+    
+    num_additional_rows = table.num_rows % ROWS_PER_PAGE
+    if num_additional_rows > 0:
+        page_num = num_full_pages
+        if pager.pages[page_num]:
+            pager_flush(pager, page_num, num_additional_rows * ROW_SIZE)
+            #free_memory(pager.pages[page_num])
+
+    pager.file_descriptor.close()
+
+
+def do_meta_command(input_buffer, table):
+    if input_buffer.buffer == ".exit":
+        db_close(table)
+        exit(1)
     else:
         return META_COMMAND_UNRECOGNIZED_COMMAND
 
@@ -138,20 +211,6 @@ def prepare_insert(input_buffer):
 
 
 def prepare_statement(input_buffer):
-#    statement = Statement()
-#    if input_buffer.buffer[:6] == "insert":
-#        statement.type = STATEMENT_INSERT
-#        args = input_buffer.buffer.split(" ", 3)
-#        if len(args) < 4:
-#            return statement, PREPARE_SYNTAX_ERROR
-#        statement.row_to_insert.id = int(args[1])
-#        statement.row_to_insert.username = args[2]
-#        statement.row_to_insert.email = args[3]
-#        return statement, PREPARE_SUCCESS
-#    if input_buffer.buffer == "select":
-#        statement.type = STATEMENT_SELECT
-#        return statement, PREPARE_SUCCESS
-
     if input_buffer.buffer[:6] == "insert":
         return prepare_insert(input_buffer)
     elif input_buffer.buffer == "select":
@@ -185,14 +244,18 @@ def execute_statement(statement, table):
         return execute_select(statement, table)
 
 
-def main():
-    table = Table()
+def main(argv):
+    if len(argv) < 2:
+        print "Must supply a database filename."
+        exit(0)
+    filename = argv[1]
+    table = db_open(filename)
     while True:
         print_prompt()
         input_buffer = read_input()
 
         if input_buffer.buffer[0] == ".":
-            result = do_meta_command(input_buffer)
+            result = do_meta_command(input_buffer, table)
             if result == META_COMMAND_SUCCESS:
                 continue
             elif result == META_COMMAND_UNRECOGNIZED_COMMAND:
@@ -222,4 +285,5 @@ def main():
             print "Error: Table full."
 
 
-main()
+if __name__ == "__main__":
+    main(sys.argv)
