@@ -9,26 +9,27 @@ class InputBuffer:
 
 
 # execute result
-EXECUTE_SUCCESS = 0
-EXECUTE_TABLE_FULL = 1
+EXECUTE_SUCCESS         = 0
+EXECUTE_DUPLICATE_KEY   = 1
+EXECUTE_TABLE_FULL      = 2
 
 # meta command result
-META_COMMAND_SUCCESS = 0
-META_COMMAND_UNRECOGNIZED_COMMAND = 1
+META_COMMAND_SUCCESS                = 0
+META_COMMAND_UNRECOGNIZED_COMMAND   = 1
 
 # prepare result
-PREPARE_SUCCESS = 0
-PREPARE_SYNTAX_ERROR = 1
-PREPARE_UNRECOGNIZED_SUCCESS = 2
-PREPARE_STRING_TOO_LONG = 3
-PREPARE_NEGATIVE_ID = 4
+PREPARE_SUCCESS                 = 0
+PREPARE_SYNTAX_ERROR            = 1
+PREPARE_UNRECOGNIZED_SUCCESS    = 2
+PREPARE_STRING_TOO_LONG         = 3
+PREPARE_NEGATIVE_ID             = 4
 
 # statement type
-STATEMENT_INSERT = 0
-STATEMENT_SELECT = 1
+STATEMENT_INSERT    = 0
+STATEMENT_SELECT    = 1
 
-COLUMN_USERNAME_SIZE = 32
-COLUMN_EMAIL_SIZE = 255
+COLUMN_USERNAME_SIZE    = 32
+COLUMN_EMAIL_SIZE       = 255
 
 
 class Row:
@@ -45,15 +46,15 @@ class Statement:
 
 
 # compact representation of a row
-ID_SIZE = struct.calcsize("I")
-USERNAME_SIZE = struct.calcsize("%ds" % COLUMN_USERNAME_SIZE)
-EMAIL_SIZE = struct.calcsize("%ds" % COLUMN_EMAIL_SIZE)
-ID_OFFSET = 0
+ID_SIZE         = struct.calcsize("I")
+USERNAME_SIZE   = struct.calcsize("%ds" % COLUMN_USERNAME_SIZE)
+EMAIL_SIZE      = struct.calcsize("%ds" % COLUMN_EMAIL_SIZE)
+ID_OFFSET       = 0
 USERNAME_OFFSET = ID_OFFSET + ID_SIZE
-EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE
-ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
+EMAIL_OFFSET    = USERNAME_OFFSET + USERNAME_SIZE
+ROW_SIZE        = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
 
-PAGE_SIZE = 4096
+PAGE_SIZE       = 4096
 TABLE_MAX_PAGES = 100
 
 malloc_a_page_memory = lambda: "\x00" * PAGE_SIZE
@@ -90,31 +91,40 @@ def print_row(row):
 
 
 # node type
-NODE_INTERNAL = 0
-NODE_LEAF = 1
+NODE_INTERNAL   = 0
+NODE_LEAF       = 1
 
 # common node header layout
-NODE_TYPE_SIZE = struct.calcsize("B")
-NODE_TYPE_OFFSET = 0
-IS_ROOT_SIZE = struct.calcsize("B")
-IS_ROOT_OFFSET = NODE_TYPE_SIZE
-PARENT_POINTER_SIZE = struct.calcsize("I")
-PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE
+NODE_TYPE_SIZE          = struct.calcsize("B")
+NODE_TYPE_OFFSET        = 0
+IS_ROOT_SIZE            = struct.calcsize("B")
+IS_ROOT_OFFSET          = NODE_TYPE_SIZE
+PARENT_POINTER_SIZE     = struct.calcsize("I")
+PARENT_POINTER_OFFSET   = IS_ROOT_OFFSET + IS_ROOT_SIZE
 COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
 
 # leaf node header layout
-LEAF_NODE_NUM_CELLS_SIZE = struct.calcsize("I")
-LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE
-LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+LEAF_NODE_NUM_CELLS_SIZE    = struct.calcsize("I")
+LEAF_NODE_NUM_CELLS_OFFSET  = COMMON_NODE_HEADER_SIZE
+LEAF_NODE_HEADER_SIZE       = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
 
 # leaf node body layout
-LEAF_NODE_KEY_SIZE = struct.calcsize("I")
-LEAF_NODE_KEY_OFFSET = 0
-LEAF_NODE_VALUE_SIZE = ROW_SIZE
-LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
-LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
-LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
-LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE
+LEAF_NODE_KEY_SIZE          = struct.calcsize("I")
+LEAF_NODE_KEY_OFFSET        = 0
+LEAF_NODE_VALUE_SIZE        = ROW_SIZE
+LEAF_NODE_VALUE_OFFSET      = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
+LEAF_NODE_CELL_SIZE         = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
+LEAF_NODE_SPACE_FOR_CELLS   = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
+LEAF_NODE_MAX_CELLS         = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE
+
+
+def get_node_type(node):
+    return struct.unpack("B", node[NODE_TYPE_OFFSET])[0]
+
+
+def set_node_type(node, type):
+    buf = struct.pack("B", type)
+    return modify_memory(node, buf, NODE_TYPE_OFFSET)
 
 
 def leaf_node_num_cells(node):
@@ -170,8 +180,36 @@ def deserialize_row(src):
 
 
 def initialize_leaf_node(node):
+    # initialize node type
+    node = set_node_type(node, NODE_LEAF)
+    # initialize num cells
     buf = struct.pack("I", 0)
-    return modify_memory(node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+    node = modify_memory(node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+    return node
+
+
+def leaf_node_find(table, page_num, key):
+    node = get_page(table.pager, page_num)
+    num_cells = leaf_node_num_cells(node)
+
+    cursor = Cursor(table, page_num, None, None)
+
+    # Binary search
+    min_index = 0
+    one_past_max_index = num_cells
+    while one_past_max_index != min_index:
+        index = (min_index + one_past_max_index) / 2
+        key_at_index = leaf_node_key(node, index)
+        if key == key_at_index:
+            cursor.cell_num = index
+            return cursor
+        if key < key_at_index:
+            one_past_max_index = index
+        else:
+            min_index = index + 1
+
+    cursor.cell_num = min_index
+    return cursor
 
 
 def get_page(pager, page_num):
@@ -196,16 +234,23 @@ def get_page(pager, page_num):
     return pager.pages[page_num]
 
 
+# Return the position of the given key
+# if key is not present, return the position where it should be inserted
+def table_find(table, key):
+    root_page_num = table.root_page_num
+    root_node = get_page(table.pager, root_page_num)
+
+    if get_node_type(root_node) == NODE_LEAF:
+        return leaf_node_find(table, root_page_num, key)
+    else:
+        print "Need to implement searching an internal node"
+        exit(0)
+
+
 def table_start(table):
     root_node = get_page(table.pager, table.root_page_num)
     num_cells = leaf_node_num_cells(root_node)
     return Cursor(table, table.root_page_num, 0, num_cells == 0)
-
-
-def table_end(table):
-    root_node = get_page(table.pager, table.root_page_num)
-    num_cells = leaf_node_num_cells(root_node)
-    return Cursor(table, table.root_page_num, num_cells, True)
 
 
 def cursor_value(cursor):
@@ -354,11 +399,18 @@ def leaf_node_insert(cursor, key, value):
 
 def execute_insert(statement, table):
     node = get_page(table.pager, table.root_page_num)
-    if leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS:
+    num_cells = leaf_node_num_cells(node)
+    if num_cells >= LEAF_NODE_MAX_CELLS:
         return EXECUTE_TABLE_FULL
 
     row_to_insert = statement.row_to_insert
-    cursor = table_end(table)
+    key_to_insert = row_to_insert.id
+    cursor = table_find(table, key_to_insert)
+
+    if cursor.cell_num < num_cells:
+        key_at_index = leaf_node_key(node, cursor.cell_num)
+        if key_at_index == key_to_insert:
+            return EXECUTE_DUPLICATE_KEY
 
     leaf_node_insert(cursor, row_to_insert.id, row_to_insert)
     return EXECUTE_SUCCESS
@@ -418,6 +470,8 @@ def main(argv):
         result = execute_statement(statement, table)
         if result == EXECUTE_SUCCESS:
             print "Executed."
+        elif result == EXECUTE_DUPLICATE_KEY:
+            print "Error: Duplicate key."
         elif result == EXECUTE_TABLE_FULL:
             print "Error: Table full."
 
