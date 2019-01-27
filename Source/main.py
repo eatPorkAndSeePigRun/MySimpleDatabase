@@ -97,11 +97,24 @@ NODE_LEAF       = 1
 # common node header layout
 NODE_TYPE_SIZE          = struct.calcsize("B")
 NODE_TYPE_OFFSET        = 0
-IS_ROOT_SIZE            = struct.calcsize("B")
+IS_ROOT_SIZE            = struct.calcsize("?")
 IS_ROOT_OFFSET          = NODE_TYPE_SIZE
 PARENT_POINTER_SIZE     = struct.calcsize("I")
 PARENT_POINTER_OFFSET   = IS_ROOT_OFFSET + IS_ROOT_SIZE
 COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
+
+# internal node header layout
+INTERNAL_NODE_NUM_KEYS_SIZE     = struct.calcsize("I")
+INTERNAL_NODE_NUM_KEYS_OFFSET   = COMMON_NODE_HEADER_SIZE
+INTERNAL_NODE_RIGHT_CHILD_SIZE  = struct.calcsize("I")
+INTERNAL_NODE_RIGHT_CHILD_OFFSET= INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE
+INTERNAL_NODE_HEADER_SIZE       = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE + \
+                                    INTERNAL_NODE_RIGHT_CHILD_SIZE
+
+# internal node body layout
+INTERNAL_NODE_KEY_SIZE      = struct.calcsize("I")
+INTERNAL_NODE_CHILD_SIZE    = struct.calcsize("I")
+INTERNAL_NODE_CELL_SIZE     = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE
 
 # leaf node header layout
 LEAF_NODE_NUM_CELLS_SIZE    = struct.calcsize("I")
@@ -116,6 +129,8 @@ LEAF_NODE_VALUE_OFFSET      = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
 LEAF_NODE_CELL_SIZE         = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
 LEAF_NODE_SPACE_FOR_CELLS   = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
 LEAF_NODE_MAX_CELLS         = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE
+LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2
+LEAF_NODE_LEFT_SPLIT_COUNT  = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT
 
 
 def get_node_type(node):
@@ -127,6 +142,54 @@ def set_node_type(node, type):
     return modify_memory(node, buf, NODE_TYPE_OFFSET)
 
 
+def is_node_root(node):
+    offset = IS_ROOT_OFFSET
+    string = node[offset: offset + IS_ROOT_SIZE]
+    return struct.unpack("?", string)[0]
+
+
+def set_node_root(node, is_root):
+    buf = struct.pack("?", is_root)
+    return modify_memory(node, buf, IS_ROOT_OFFSET)
+
+
+def internal_node_num_keys(node):
+    offset = INTERNAL_NODE_NUM_KEYS_OFFSET
+    string = node[offset: offset + INTERNAL_NODE_NUM_KEYS_SIZE]
+    return struct.unpack("I", string)[0]
+
+
+def internal_node_right_child(node):
+    offset = INTERNAL_NODE_RIGHT_CHILD_OFFSET
+    string = node[offset: offset + INTERNAL_NODE_RIGHT_CHILD_SIZE]
+    return struct.unpack("I", string)[0]
+
+
+def internal_node_cell(node, cell_num):
+    offset = INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE
+    string = node[offset: offset + INTERNAL_NODE_CELL_SIZE]
+    return struct.unpack("I", string)[0]
+
+
+def internal_node_child(node, child_num):
+    num_keys = internal_node_num_keys(node)
+    if child_num > num_keys:
+        print "Tried to access child_num %d > num_keys %d" % (child_num, num_keys)
+        exit(0)
+    elif child_num == num_keys:
+        return internal_node_right_child(node)
+    else:
+        offset = INTERNAL_NODE_HEADER_SIZE + child_num * INTERNAL_NODE_CELL_SIZE
+        string = node[offset: offset + INTERNAL_NODE_CHILD_SIZE]
+        return struct.unpack("I", string)[0]
+
+
+def internal_node_key(node, key_num):
+    offset = INTERNAL_NODE_HEADER_SIZE + key_num * INTERNAL_NODE_CELL_SIZE + INTERNAL_NODE_CHILD_SIZE
+    string = node[offset: offset + INTERNAL_NODE_KEY_SIZE]
+    return struct.unpack("I", string)[0]
+
+
 def leaf_node_num_cells(node):
     offset = LEAF_NODE_NUM_CELLS_OFFSET
     string = node[offset: offset + LEAF_NODE_NUM_CELLS_SIZE]
@@ -135,17 +198,26 @@ def leaf_node_num_cells(node):
 
 def leaf_node_cell(node, cell_num):
     offset = LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE
-    return node[offset: offset + LEAF_NODE_NUM_CELLS_SIZE]
+    return node[offset: offset + LEAF_NODE_CELL_SIZE]
 
 
 def leaf_node_key(node, cell_num):
-    buf = leaf_node_cell(node, cell_num)
-    return struct.unpack("I", buf)[0]
+    offset = LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE
+    string = node[offset: offset + LEAF_NODE_KEY_SIZE]
+    return struct.unpack("I", string)[0]
 
 
 def leaf_node_value(node, cell_num):
     offset = (LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE) + LEAF_NODE_KEY_SIZE
     return node[offset: offset + LEAF_NODE_VALUE_SIZE]
+
+
+def get_node_max_key(node):
+    result = get_node_type(node)
+    if result == NODE_INTERNAL:
+        return internal_node_key(node, internal_node_num_keys(node) - 1)
+    elif result == NODE_LEAF:
+        return leaf_node_key(node, leaf_node_num_cells(node) - 1)
 
 
 def print_constants():
@@ -157,12 +229,34 @@ def print_constants():
     print "LEAF_NODE_MAX_CELLS: %d" % LEAF_NODE_MAX_CELLS
 
 
-def print_leaf_node(node):
-    num_cells = leaf_node_num_cells(node)
-    print "leaf (size %d)" % num_cells
-    for i in range(num_cells):
-        key = leaf_node_key(node, i)
-        print "  - %d : %d" % (i, key)
+def indent(level):
+    for i in range(level):
+        print " ",
+
+
+def print_tree(pager, page_num, indentation_level):
+    node = get_page(pager, page_num)
+    result = get_node_type(node)
+
+    if result == NODE_LEAF:
+        num_keys = leaf_node_num_cells(node)
+        indent(indentation_level)
+        print "- leaf (size %d)" % num_keys
+        for i in range(num_keys):
+            indent(indentation_level + 1)
+            print "- %d" % leaf_node_key(node, i)
+    elif result == NODE_INTERNAL:
+        num_keys = internal_node_num_keys(node)
+        indent(indentation_level)
+        print "- internal (size %d)" % num_keys
+        for i in range(num_keys):
+            child = internal_node_child(node, i)
+            print_tree(pager, child, indentation_level + 1)
+
+            indent(indentation_level)
+            print "- key %d" % internal_node_key(node, i)
+        child = internal_node_right_child(node)
+        print_tree(pager, child, indentation_level + 1)
 
 
 def serialize_row(src):
@@ -182,9 +276,22 @@ def deserialize_row(src):
 def initialize_leaf_node(node):
     # initialize node type
     node = set_node_type(node, NODE_LEAF)
+    # initialize node root
+    node = set_node_root(node, False)
     # initialize num cells
     buf = struct.pack("I", 0)
     node = modify_memory(node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+    return node
+
+
+def initialize_internal_node(node):
+    # initialize node type
+    node = set_node_type(node, NODE_INTERNAL)
+    # initialize node root
+    node = set_node_root(node, False)
+    # initialize num keys
+    buf = struct.pack("I", 0)
+    node = modify_memory(node, buf, INTERNAL_NODE_NUM_KEYS_OFFSET)
     return node
 
 
@@ -288,7 +395,9 @@ def db_open(filename):
     if pager.num_pages == 0:
         # New database file. Initialize page 0 as leaf node.
         root_node = get_page(pager, 0)
-        table.pager.pages[0] = initialize_leaf_node(root_node)
+        root_node = initialize_leaf_node(root_node)
+        root_node = set_node_root(root_node, True)
+        table.pager.pages[0] = root_node
 
     return table
 
@@ -328,7 +437,7 @@ def do_meta_command(input_buffer, table):
         exit(1)
     elif input_buffer.buffer == ".btree":
         print "Tree:"
-        print_leaf_node(get_page(table.pager, 0))
+        print_tree(table.pager, 0, 0)
         return META_COMMAND_SUCCESS
     elif input_buffer.buffer == ".constants":
         print "Constants:"
@@ -367,14 +476,110 @@ def prepare_statement(input_buffer):
         return None, PREPARE_UNRECOGNIZED_SUCCESS
 
 
+# until recycling free pages, new pages will always go onto the end of the database file
+def get_unused_page_num(pager):
+    return pager.num_pages
+
+
+def create_new_root(table, right_child_page_num):
+    # handle splitting the root
+    # old root copied to new page, becomes left child
+    # address of right child passed in
+    # re-initialize root page to contain the new root node
+    # new root node points to two children
+    root = get_page(table.pager, table.root_page_num)
+    right_child = get_page(table.pager, right_child_page_num)
+    left_child_page_num = get_unused_page_num(table.pager)
+    left_child = get_page(table.pager, left_child_page_num)
+
+    # left child has data copied from old root
+    left_child = root
+    left_child = set_node_root(left_child, False)
+
+    # root node is a new internal node with one key and two children
+    root = initialize_internal_node(root)
+    root = set_node_root(root, True)
+    # set internal node num key
+    buf = struct.pack("I", 1)
+    root = modify_memory(root, buf, INTERNAL_NODE_NUM_KEYS_OFFSET)
+    # set internal node child
+    buf = struct.pack("I", left_child_page_num)
+    num_keys = internal_node_num_keys(root)
+    if num_keys < 0:
+        print "Tried to access child_num %d > num_keys %d" % (0, num_keys)
+        exit(0)
+    elif num_keys == 0:
+        root = modify_memory(root, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
+    else:
+        root = modify_memory(root, buf, INTERNAL_NODE_HEADER_SIZE)
+    # set internal node key
+    left_child_max_key = get_node_max_key(left_child)
+    buf = struct.pack("I", left_child_max_key)
+    root = modify_memory(root, buf, INTERNAL_NODE_HEADER_SIZE + INTERNAL_NODE_CHILD_SIZE)
+    # set internal node right child
+    buf = struct.pack("I", right_child_page_num)
+    root = modify_memory(root, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
+
+    table.pager.pages[table.root_page_num] = root
+    table.pager.pages[right_child_page_num] = right_child
+    table.pager.pages[left_child_page_num] = left_child
+
+
+def leaf_node_split_and_insert(cursor, key, value):
+    # create a new node move half the cells over
+    # insert the new value in one of the two nodes
+    # update parent or create a new parent
+    old_node = get_page(cursor.table.pager, cursor.page_num)
+    new_page_num = get_unused_page_num(cursor.table.pager)
+    new_node = get_page(cursor.table.pager, new_page_num)
+    new_node = initialize_leaf_node(new_node)
+
+    # all existing keys plus new key should be divided evenly between old and new nodes
+    # starting from the right, move each key to correct position
+    for i in range(LEAF_NODE_MAX_CELLS, 0, -1):
+        if i == cursor.cell_num:
+            buf = serialize_row(value)
+        elif i > cursor.cell_num:
+            pos = LEAF_NODE_HEADER_SIZE + (i - 1) * LEAF_NODE_CELL_SIZE
+            buf = old_node[pos: pos + LEAF_NODE_CELL_SIZE]
+        else:
+            pos = LEAF_NODE_HEADER_SIZE + i * LEAF_NODE_CELL_SIZE
+            buf = old_node[pos: pos + LEAF_NODE_CELL_SIZE]
+
+        index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT
+        offset = LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE
+
+        if i >= LEAF_NODE_LEFT_SPLIT_COUNT:
+            new_node = modify_memory(new_node, buf, offset)
+        else:
+            old_node = modify_memory(old_node, buf, offset)
+
+    # update cell count on both leaf nodes
+    buf = struct.pack("I", LEAF_NODE_LEFT_SPLIT_COUNT)
+    old_node = modify_memory(old_node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+    buf = struct.pack("I", LEAF_NODE_RIGHT_SPLIT_COUNT)
+    new_node = modify_memory(new_node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+
+    cursor.table.pager.pages[cursor.page_num] = old_node
+    cursor.table.pager.pages[new_page_num] = new_node
+
+    if is_node_root(old_node):
+        create_new_root(cursor.table, new_page_num)
+        return
+    else:
+        print "Need to implement updating parent after split"
+        exit(0)
+
+
+
 def leaf_node_insert(cursor, key, value):
     node = get_page(cursor.table.pager, cursor.page_num)
 
     num_cells = leaf_node_num_cells(node)
     if num_cells >= LEAF_NODE_MAX_CELLS:
         # node full
-        print "Need to implement splitting a leaf node."
-        exit(0)
+        leaf_node_split_and_insert(cursor, key, value)
+        return
 
     if cursor.cell_num < num_cells:
         # Make room for new cell
@@ -400,8 +605,6 @@ def leaf_node_insert(cursor, key, value):
 def execute_insert(statement, table):
     node = get_page(table.pager, table.root_page_num)
     num_cells = leaf_node_num_cells(node)
-    if num_cells >= LEAF_NODE_MAX_CELLS:
-        return EXECUTE_TABLE_FULL
 
     row_to_insert = statement.row_to_insert
     key_to_insert = row_to_insert.id
@@ -434,10 +637,11 @@ def execute_statement(statement, table):
 
 
 def main(argv):
-    if len(argv) < 2:
-        print "Must supply a database filename."
-        exit(0)
-    filename = argv[1]
+    # if len(argv) < 2:
+    #     print "Must supply a database filename."
+    #     exit(0)
+    # filename = argv[1]
+    filename = "mydb.db"
     table = db_open(filename)
     while True:
         print_prompt()
