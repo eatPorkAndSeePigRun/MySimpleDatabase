@@ -119,7 +119,10 @@ INTERNAL_NODE_CELL_SIZE     = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE
 # leaf node header layout
 LEAF_NODE_NUM_CELLS_SIZE    = struct.calcsize("I")
 LEAF_NODE_NUM_CELLS_OFFSET  = COMMON_NODE_HEADER_SIZE
-LEAF_NODE_HEADER_SIZE       = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+LEAF_NODE_NEXT_LEAF_SIZE    = struct.calcsize("I")
+LEAF_NODE_NEXT_LEAF_OFFSET  = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE
+LEAF_NODE_HEADER_SIZE       = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + \
+                                LEAF_NODE_NEXT_LEAF_SIZE
 
 # leaf node body layout
 LEAF_NODE_KEY_SIZE          = struct.calcsize("I")
@@ -193,6 +196,12 @@ def internal_node_key(node, key_num):
 def leaf_node_num_cells(node):
     offset = LEAF_NODE_NUM_CELLS_OFFSET
     string = node[offset: offset + LEAF_NODE_NUM_CELLS_SIZE]
+    return struct.unpack("I", string)[0]
+
+
+def leaf_node_next_leaf(node):
+    offset = LEAF_NODE_NEXT_LEAF_OFFSET
+    string = node[offset: offset + LEAF_NODE_NEXT_LEAF_SIZE]
     return struct.unpack("I", string)[0]
 
 
@@ -281,6 +290,8 @@ def initialize_leaf_node(node):
     # initialize num cells
     buf = struct.pack("I", 0)
     node = modify_memory(node, buf, LEAF_NODE_NUM_CELLS_OFFSET)
+    # initialize next leaf
+    node = modify_memory(node, buf, LEAF_NODE_NEXT_LEAF_OFFSET) # 0 represents no sibling
     return node
 
 
@@ -379,9 +390,13 @@ def table_find(table, key):
 
 
 def table_start(table):
-    root_node = get_page(table.pager, table.root_page_num)
-    num_cells = leaf_node_num_cells(root_node)
-    return Cursor(table, table.root_page_num, 0, num_cells == 0)
+    cursor = table_find(table, 0)
+
+    node = get_page(table.pager, cursor.page_num)
+    num_cells = leaf_node_num_cells(node)
+    cursor.end_of_table = (num_cells == 0)
+
+    return cursor
 
 
 def cursor_value(cursor):
@@ -396,7 +411,14 @@ def cursor_advance(cursor):
 
     cursor.cell_num += 1
     if cursor.cell_num >= leaf_node_num_cells(node):
-        cursor.end_of_table = True
+        # advance to next leaf node
+        next_page_num = leaf_node_next_leaf(node)
+        if next_page_num == 0:
+            # this was rightmost leaf
+            cursor.end_of_table = True
+        else:
+            cursor.page_num = next_page_num
+            cursor.cell_num = 0
 
 
 def pager_open(filename):
@@ -557,12 +579,28 @@ def leaf_node_split_and_insert(cursor, key, value):
     new_page_num = get_unused_page_num(cursor.table.pager)
     new_node = get_page(cursor.table.pager, new_page_num)
     new_node = initialize_leaf_node(new_node)
+    # update leaf node next leaf
+    buf = struct.pack("I", leaf_node_next_leaf(old_node))
+    new_node = modify_memory(new_node, buf, LEAF_NODE_NEXT_LEAF_OFFSET)
+    # update leaf node next leaf
+    buf = struct.pack("I", new_page_num)
+    old_node = modify_memory(old_node, buf, LEAF_NODE_NEXT_LEAF_OFFSET)
 
     # all existing keys plus new key should be divided evenly between old and new nodes
     # starting from the right, move each key to correct position
     for i in range(LEAF_NODE_MAX_CELLS, 0, -1):
+        index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT
+
         if i == cursor.cell_num:
+            # set leaf node value
             buf = serialize_row(value)
+            value_offset = (LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE) + LEAF_NODE_KEY_SIZE
+            new_node = modify_memory(new_node, buf, value_offset)
+            # set leaf node key
+            buf = struct.pack("I", key)
+            key_offset = LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE
+            new_node = modify_memory(new_node, buf, key_offset)
+            continue
         elif i > cursor.cell_num:
             pos = LEAF_NODE_HEADER_SIZE + (i - 1) * LEAF_NODE_CELL_SIZE
             buf = old_node[pos: pos + LEAF_NODE_CELL_SIZE]
@@ -570,9 +608,7 @@ def leaf_node_split_and_insert(cursor, key, value):
             pos = LEAF_NODE_HEADER_SIZE + i * LEAF_NODE_CELL_SIZE
             buf = old_node[pos: pos + LEAF_NODE_CELL_SIZE]
 
-        index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT
         offset = LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE
-
         if i >= LEAF_NODE_LEFT_SPLIT_COUNT:
             new_node = modify_memory(new_node, buf, offset)
         else:
@@ -661,11 +697,10 @@ def execute_statement(statement, table):
 
 
 def main(argv):
-    # if len(argv) < 2:
-    #     print "Must supply a database filename."
-    #     exit(0)
-    # filename = argv[1]
-    filename = "mydb.db"
+    if len(argv) < 2:
+        print "Must supply a database filename."
+        exit(0)
+    filename = argv[1]
     table = db_open(filename)
     while True:
         print_prompt()
