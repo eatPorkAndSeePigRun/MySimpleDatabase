@@ -341,6 +341,31 @@ def get_page(pager, page_num):
     return pager.pages[page_num]
 
 
+def internal_node_find(table, page_num, key):
+    node = get_page(table.pager, page_num)
+    num_keys = internal_node_num_keys(node)
+
+    # Binary search to find index of child to search
+    min_index = 0
+    max_index = num_keys    # there is one more child than key
+
+    while min_index != max_index:
+        index = (min_index + max_index) / 2
+        key_to_right = internal_node_key(node, index)
+        if key_to_right >= key:
+            max_index = index
+        else:
+            min_index = index + 1
+
+    child_num = internal_node_child(node, min_index)
+    child = get_page(table.pager, child_num)
+    result = get_node_type(child)
+    if result == NODE_LEAF:
+        return leaf_node_find(table, child_num, key)
+    elif result == NODE_INTERNAL:
+        return internal_node_find(table, child_num, key)
+
+
 # Return the position of the given key
 # if key is not present, return the position where it should be inserted
 def table_find(table, key):
@@ -350,8 +375,7 @@ def table_find(table, key):
     if get_node_type(root_node) == NODE_LEAF:
         return leaf_node_find(table, root_page_num, key)
     else:
-        print "Need to implement searching an internal node"
-        exit(0)
+        return internal_node_find(table, root_page_num, key)
 
 
 def table_start(table):
