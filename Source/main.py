@@ -115,6 +115,7 @@ INTERNAL_NODE_HEADER_SIZE       = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KE
 INTERNAL_NODE_KEY_SIZE      = struct.calcsize("I")
 INTERNAL_NODE_CHILD_SIZE    = struct.calcsize("I")
 INTERNAL_NODE_CELL_SIZE     = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE
+INTERNAL_NODE_MAX_CELLS     = 3  # keep this small for testing
 
 # leaf node header layout
 LEAF_NODE_NUM_CELLS_SIZE    = struct.calcsize("I")
@@ -156,6 +157,12 @@ def set_node_root(node, is_root):
     return modify_memory(node, buf, IS_ROOT_OFFSET)
 
 
+def node_parent(node):
+    offset = PARENT_POINTER_OFFSET
+    string = node[offset: offset + PARENT_POINTER_SIZE]
+    return struct.unpack("I", string)[0]
+
+
 def internal_node_num_keys(node):
     offset = INTERNAL_NODE_NUM_KEYS_OFFSET
     string = node[offset: offset + INTERNAL_NODE_NUM_KEYS_SIZE]
@@ -170,8 +177,7 @@ def internal_node_right_child(node):
 
 def internal_node_cell(node, cell_num):
     offset = INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE
-    string = node[offset: offset + INTERNAL_NODE_CELL_SIZE]
-    return struct.unpack("I", string)[0]
+    return node[offset: offset + INTERNAL_NODE_CELL_SIZE]
 
 
 def internal_node_child(node, child_num):
@@ -352,14 +358,13 @@ def get_page(pager, page_num):
     return pager.pages[page_num]
 
 
-def internal_node_find(table, page_num, key):
-    node = get_page(table.pager, page_num)
-    num_keys = internal_node_num_keys(node)
+def internal_node_find_child(node, key):
+    # return the index of the child which should contain the given key
 
-    # Binary search to find index of child to search
+    num_keys = internal_node_num_keys(node)
+    # Binary search
     min_index = 0
     max_index = num_keys    # there is one more child than key
-
     while min_index != max_index:
         index = (min_index + max_index) / 2
         key_to_right = internal_node_key(node, index)
@@ -367,8 +372,14 @@ def internal_node_find(table, page_num, key):
             max_index = index
         else:
             min_index = index + 1
+    return min_index
 
-    child_num = internal_node_child(node, min_index)
+
+def internal_node_find(table, page_num, key):
+    node = get_page(table.pager, page_num)
+
+    child_index = internal_node_find_child(node, key)
+    child_num = internal_node_child(node, child_index)
     child = get_page(table.pager, child_num)
     result = get_node_type(child)
     if result == NODE_LEAF:
@@ -566,9 +577,91 @@ def create_new_root(table, right_child_page_num):
     buf = struct.pack("I", right_child_page_num)
     root = modify_memory(root, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
 
+    # update node parent
+    buf = struct.pack("I", table.root_page_num)
+    right_child = modify_memory(right_child, buf, PARENT_POINTER_OFFSET)
+    left_child = modify_memory(left_child, buf, PARENT_POINTER_OFFSET)
+
     table.pager.pages[table.root_page_num] = root
     table.pager.pages[right_child_page_num] = right_child
     table.pager.pages[left_child_page_num] = left_child
+
+
+def internal_node_insert(table, parent_page_num, child_page_num):
+    # add a new child/key pair to parent that corresponds to child
+
+    parent = get_page(table.pager, parent_page_num)
+    child = get_page(table.pager, child_page_num)
+    child_max_key = get_node_max_key(child)
+    index = internal_node_find_child(parent, child_max_key)
+
+    original_num_keys = internal_node_num_keys(parent)
+    # update internal node num keys
+    buf = struct.pack("I", original_num_keys + 1)
+    parent = modify_memory(parent, buf, INTERNAL_NODE_NUM_KEYS_OFFSET)
+
+    if original_num_keys >= INTERNAL_NODE_MAX_CELLS:
+        print "Need to implement splitting internal node"
+        exit(0)
+
+    right_child_page_num = internal_node_right_child(parent)
+    right_child = get_page(table.pager, right_child_page_num)
+
+    if child_max_key > get_node_max_key(right_child):
+        # replace right child
+        #   update internal node child
+        buf = struct.pack("I", right_child_page_num)
+        num_keys = internal_node_num_keys(parent)
+        if num_keys < original_num_keys:
+            print "Tried to access child_num %d > num_keys %d" % (original_num_keys, num_keys)
+            exit(0)
+        elif num_keys == original_num_keys:
+            parent = modify_memory(parent, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
+        else:
+            offset = INTERNAL_NODE_HEADER_SIZE + original_num_keys * INTERNAL_NODE_CELL_SIZE
+            parent = modify_memory(parent, buf, offset)
+
+        #   update internal node key
+        buf = struct.pack("I", get_node_max_key(right_child))
+        offset = INTERNAL_NODE_HEADER_SIZE + original_num_keys * INTERNAL_NODE_CELL_SIZE + INTERNAL_NODE_CHILD_SIZE
+        parent = modify_memory(parent, buf, offset)
+
+        #   update internal node right child
+        buf = struct.pack("I", child_page_num)
+        parent = modify_memory(parent, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
+    else:
+        # make room for the new cell
+        for i in range(original_num_keys, index, -1):
+            buf = internal_node_cell(parent, i - 1)
+            offset = INTERNAL_NODE_HEADER_SIZE + i * INTERNAL_NODE_CELL_SIZE
+            parent = modify_memory(parent, buf, offset)
+
+        # update internal node child
+        buf = struct.pack("I", child_page_num)
+        num_keys = internal_node_num_keys(parent)
+        if num_keys < index:
+            print "Tried to access child_num %d > num_keys %d" % (index, num_keys)
+            exit(0)
+        elif num_keys == index:
+            parent = modify_memory(parent, buf, INTERNAL_NODE_RIGHT_CHILD_OFFSET)
+        else:
+            offset = INTERNAL_NODE_HEADER_SIZE + index * INTERNAL_NODE_CELL_SIZE
+            parent = modify_memory(parent, buf, offset)
+
+        # update internal node key
+        buf = struct.pack("I", child_max_key)
+        offset = INTERNAL_NODE_HEADER_SIZE + index * INTERNAL_NODE_CELL_SIZE + INTERNAL_NODE_CHILD_SIZE
+        parent = modify_memory(parent, buf, offset)
+
+    table.pager.pages[table.root_page_num] = parent
+
+
+def update_internal_node_key(node, old_key, new_key):
+    old_child_index = internal_node_find_child(node, old_key)
+    # update internal node key
+    buf = struct.pack("I", new_key)
+    offset = INTERNAL_NODE_HEADER_SIZE + old_child_index * INTERNAL_NODE_CELL_SIZE + INTERNAL_NODE_CHILD_SIZE
+    return modify_memory(node, buf, offset)
 
 
 def leaf_node_split_and_insert(cursor, key, value):
@@ -576,9 +669,13 @@ def leaf_node_split_and_insert(cursor, key, value):
     # insert the new value in one of the two nodes
     # update parent or create a new parent
     old_node = get_page(cursor.table.pager, cursor.page_num)
+    old_max = get_node_max_key(old_node)
     new_page_num = get_unused_page_num(cursor.table.pager)
     new_node = get_page(cursor.table.pager, new_page_num)
     new_node = initialize_leaf_node(new_node)
+    # update node parent
+    buf = struct.pack("I", node_parent(old_node))
+    new_node = modify_memory(new_node, buf, PARENT_POINTER_OFFSET)
     # update leaf node next leaf
     buf = struct.pack("I", leaf_node_next_leaf(old_node))
     new_node = modify_memory(new_node, buf, LEAF_NODE_NEXT_LEAF_OFFSET)
@@ -588,18 +685,22 @@ def leaf_node_split_and_insert(cursor, key, value):
 
     # all existing keys plus new key should be divided evenly between old and new nodes
     # starting from the right, move each key to correct position
-    for i in range(LEAF_NODE_MAX_CELLS, 0, -1):
+    for i in range(LEAF_NODE_MAX_CELLS, -1, -1):
         index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT
 
         if i == cursor.cell_num:
             # set leaf node value
-            buf = serialize_row(value)
+            value_buf = serialize_row(value)
             value_offset = (LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE) + LEAF_NODE_KEY_SIZE
-            new_node = modify_memory(new_node, buf, value_offset)
             # set leaf node key
-            buf = struct.pack("I", key)
+            key_buf = struct.pack("I", key)
             key_offset = LEAF_NODE_HEADER_SIZE + index_within_node * LEAF_NODE_CELL_SIZE
-            new_node = modify_memory(new_node, buf, key_offset)
+            if i > LEAF_NODE_LEFT_SPLIT_COUNT:
+                new_node = modify_memory(new_node, value_buf, value_offset)
+                new_node = modify_memory(new_node, key_buf, key_offset)
+            else:
+                old_node = modify_memory(old_node, value_buf, value_offset)
+                old_node = modify_memory(old_node, key_buf, key_offset)
             continue
         elif i > cursor.cell_num:
             pos = LEAF_NODE_HEADER_SIZE + (i - 1) * LEAF_NODE_CELL_SIZE
@@ -627,9 +728,15 @@ def leaf_node_split_and_insert(cursor, key, value):
         create_new_root(cursor.table, new_page_num)
         return
     else:
-        print "Need to implement updating parent after split"
-        exit(0)
+        parent_page_num = node_parent(old_node)
+        new_max = get_node_max_key(old_node)
+        parent = get_page(cursor.table.pager, parent_page_num)
 
+        parent = update_internal_node_key(parent, old_max, new_max)
+
+        cursor.table.pager.pages[parent_page_num] = parent
+        internal_node_insert(cursor.table, parent_page_num, new_page_num)
+        return
 
 
 def leaf_node_insert(cursor, key, value):
